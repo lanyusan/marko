@@ -1,4 +1,5 @@
 import path from "path";
+import { createHash } from "crypto";
 import { types as t } from "@marko/babel-types";
 import { getLoc, ___setTaglibLookup } from "@marko/babel-utils";
 import { buildLookup } from "../taglib";
@@ -9,8 +10,8 @@ import traverse, { visitors } from "@babel/traverse";
 import { getRootDir } from "lasso-package-root";
 import markoModules from "../../modules";
 import { MarkoFile } from "./file";
-import checksum from "./util/checksum";
 
+const TEMP_METADATA_FOR_AST = new WeakMap();
 let ROOT = process.cwd();
 try {
   ROOT = getRootDir(ROOT);
@@ -19,12 +20,15 @@ try {
 
 export default (api, markoOpts) => {
   api.assertVersion(7);
+  const userCache = markoOpts.cache;
+  const fs = markoOpts.fileSystem;
   const translator = markoOpts.translator;
-  const optimize = (markoOpts.optimize =
-    markoOpts.optimize === undefined
-      ? api.env("production")
-      : markoOpts.optimize);
+
   markoOpts.output = markoOpts.output || "html";
+
+  if (markoOpts.optimize === undefined) {
+    markoOpts.optimize = api.env("production");
+  }
 
   if (!translator || !translator.visitor) {
     throw new Error(
@@ -35,16 +39,53 @@ export default (api, markoOpts) => {
   return {
     name: "marko",
     parserOverride(code, jsParseOptions) {
-      const watchFiles = new Set();
+      let compileCache = userCache.get(translator);
+
+      if (!compileCache) {
+        userCache.set(translator, (compileCache = new Map()));
+      }
+
       const filename = jsParseOptions.sourceFileName;
       const componentId = path.relative(ROOT, filename);
-      const taglibLookup = buildLookup(
-        path.dirname(filename),
-        markoOpts.translator
-      );
-      const file = new MarkoFile(jsParseOptions, {
-        code,
-        ast: {
+      const contentHash = createHash("MD5")
+        .update(code)
+        .digest("hex");
+      const cacheKey = createHash("MD5")
+        .update(componentId)
+        .update(markoOpts.migrate ? "\0" : "")
+        .digest("hex");
+
+      let cached = compileCache.get(cacheKey);
+
+      if (cached) {
+        if (cached.contentHash !== contentHash) {
+          // File content changed, invalidate the cache.
+          cached = undefined;
+        } else {
+          for (const watchFile of cached.meta.watchFiles) {
+            let mtime = Infinity;
+            try {
+              mtime = fs.statSync(watchFile).mtime;
+              // eslint-disable-next-line no-empty
+            } catch {}
+
+            if (mtime > cached.time) {
+              // Some dependency changed, invalidate the cache.
+              cached = undefined;
+              break;
+            }
+          }
+        }
+      }
+
+      let ast;
+      let meta;
+
+      if (cached) {
+        ast = t.cloneDeep(cached.ast);
+        meta = cloneMeta(cached.meta);
+      } else {
+        ast = {
           type: "File",
           program: {
             type: "Program",
@@ -52,38 +93,57 @@ export default (api, markoOpts) => {
             body: [],
             directives: []
           }
-        }
-      });
-      file.ast.start = file.ast.program.start = 0;
-      file.ast.end = file.ast.program.end = code.length - 1;
-      file.ast.loc = file.ast.program.loc = {
-        start: { line: 0, column: 0 },
-        end: getLoc(file, file.ast.end)
-      };
+        };
 
-      file.metadata.marko = {
-        id: optimize ? checksum(componentId) : componentId,
-        deps: [],
-        tags: [],
-        watchFiles
-      };
+        meta = {
+          id: componentId,
+          macros: {},
+          deps: [],
+          tags: [],
+          watchFiles: new Set()
+        };
+      }
 
+      const file = new MarkoFile(jsParseOptions, { code, ast });
+
+      file.metadata.marko = meta;
       file.markoOpts = markoOpts;
 
+      const taglibLookup = buildLookup(
+        path.dirname(filename),
+        markoOpts.translator
+      );
       ___setTaglibLookup(file, taglibLookup);
-      parseMarko(file);
 
-      if (!markoOpts._parseOnly) {
-        file.path.scope.crawl(); // Initialize bindings.
+      if (!cached) {
         const rootMigrators = Object.values(taglibLookup.taglibsById)
           .map(({ migratorPath }) => {
             if (migratorPath) {
               const mod = markoModules.require(migratorPath);
-              watchFiles.add(migratorPath);
+              meta.watchFiles.add(migratorPath);
               return (mod.default || mod)(api, markoOpts);
             }
           })
           .filter(Boolean);
+
+        const rootTransformers = taglibLookup.merged.transformers.map(
+          ({ path: transformerPath }) => {
+            const mod = markoModules.require(transformerPath);
+            meta.watchFiles.add(transformerPath);
+            return (mod.default || mod)(api, markoOpts);
+          }
+        );
+
+        file.ast.start = file.ast.program.start = 0;
+        file.ast.end = file.ast.program.end = code.length - 1;
+        file.ast.loc = file.ast.program.loc = {
+          start: { line: 0, column: 0 },
+          end: getLoc(file, file.ast.end)
+        };
+
+        parseMarko(file);
+        file.path.scope.crawl(); // Initialize bindings.
+
         traverse(
           file.ast,
           rootMigrators.length
@@ -91,24 +151,29 @@ export default (api, markoOpts) => {
             : migrate,
           file.scope
         );
-        if (!markoOpts._migrateOnly) {
-          const rootTransformers = taglibLookup.merged.transformers.map(
-            ({ path: transformerPath }) => {
-              const mod = markoModules.require(transformerPath);
-              watchFiles.add(transformerPath);
-              return (mod.default || mod)(api, markoOpts);
-            }
-          );
-          traverse(
-            file.ast,
-            rootTransformers.length
-              ? visitors.merge(rootTransformers.concat(transform))
-              : transform,
-            file.scope
-          );
 
-          traverse(file.ast, translator.visitor, file.scope);
+        traverse(
+          file.ast,
+          rootTransformers.length
+            ? visitors.merge(rootTransformers.concat(transform))
+            : transform,
+          file.scope
+        );
+
+        compileCache.set(cacheKey, {
+          ast: t.cloneDeep(file.ast),
+          meta: cloneMeta(meta),
+          contentHash,
+          time: Date.now()
+        });
+      }
+
+      if (markoOpts._translate !== false) {
+        if (cached) {
+          file.path.scope.crawl(); // Initialize bindings.
         }
+
+        traverse(file.ast, translator.visitor, file.scope);
       }
 
       const result = t.cloneDeep(file.ast);
@@ -120,21 +185,31 @@ export default (api, markoOpts) => {
           filePath[filePath.length - 5] === "." &&
           filePath.endsWith("marko.json")
         ) {
-          watchFiles.add(filePath);
+          meta.watchFiles.add(filePath);
         }
       }
 
       file.metadata.marko.watchFiles = Array.from(
         file.metadata.marko.watchFiles
       );
-      result._meta = file.metadata.marko;
+
+      TEMP_METADATA_FOR_AST.set(result, file.metadata.marko);
 
       return result;
     },
     pre(file) {
       // Copy over the Marko specific metadata.
-      file.metadata.marko = file.ast._meta;
-      delete file.ast._meta;
+      file.metadata.marko = TEMP_METADATA_FOR_AST.get(file.ast);
     }
   };
 };
+
+function cloneMeta(meta) {
+  return {
+    id: meta.id,
+    macros: { ...meta.macros },
+    deps: meta.deps.slice(),
+    tags: meta.tags.slice(),
+    watchFiles: new Set(meta.watchFiles)
+  };
+}

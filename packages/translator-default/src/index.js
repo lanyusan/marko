@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { types as t } from "@marko/babel-types";
 import {
   parseExpression,
@@ -36,6 +37,10 @@ export const visitor = {
       const {
         hub: { file }
       } = path;
+
+      file._componentDefIdentifier = path.scope.generateUidIdentifier(
+        "component"
+      );
 
       if (file._moduleCode) {
         path.get("body").forEach(bodyItemPath => bodyItemPath.remove());
@@ -132,7 +137,13 @@ export const visitor = {
         templateIdentifier,
         t.identifier("meta")
       );
-      const componentId = meta.id;
+
+      const componentId = markoOpts.optimize
+        ? createHash("MD5")
+            .update(meta.id)
+            .digest("base64")
+            .slice(0, 8)
+        : meta.id;
 
       if (markoOpts.writeVersionComment) {
         path.addComment(
